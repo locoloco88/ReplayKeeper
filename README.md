@@ -8,6 +8,12 @@ when league updates your old replays break because the client checks the game ve
 
 this tool patches the files so the client loads them anyway
 
+<p align="center">
+  <a href="https://youtu.be/f_kv3lmlOBw">
+    <img src="https://img.youtube.com/vi/f_kv3lmlOBw/maxresdefault.jpg" width="700">
+  </a>
+</p>
+
 ## usage
 
 1 run it
