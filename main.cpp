@@ -218,7 +218,8 @@ static std::string ExtractPatchFromFile(const std::wstring& filePath) {
     size_t versionStart = branchPos;
     while (versionStart > 0) {
         versionStart--;
-        if (!isdigit(content[versionStart]) && content[versionStart] != '.') {
+        unsigned char ch = static_cast<unsigned char>(content[versionStart]);
+        if (!isdigit(ch) && ch != '.') {
             versionStart++;
             break;
         }
@@ -260,8 +261,9 @@ static bool PatchMetadataFile(const std::wstring& filePath, const std::string& m
     int dotsFound = 0;
     while (versionStart > 0) {
         versionStart--;
-        if (content[versionStart] == '.') dotsFound++;
-        if (!isdigit(content[versionStart]) && content[versionStart] != '.') {
+        unsigned char ch = static_cast<unsigned char>(content[versionStart]);
+        if (ch == '.') dotsFound++;
+        if (!isdigit(ch) && ch != '.') {
             versionStart++;
             break;
         }
