@@ -12,6 +12,7 @@ struct GuiState {
     std::atomic<bool> running{true};
     std::atomic<bool> filesCopied{false};
     std::atomic<bool> leagueClientRunning{false};
+    std::atomic<bool> copyNoticePending{false};
     std::wstring leagueInstallPath;
     bool pathFromRegistry = false;
     std::wstring riotClientPath;

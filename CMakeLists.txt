@@ -21,6 +21,8 @@ add_executable(ReplayKeeper WIN32
     main.cpp
     gui.cpp
     gui.hpp
+    image_resources.cpp
+    image_resources.hpp
     lcu.cpp
     lcu.hpp
     ${IMGUI_SOURCES}
@@ -37,5 +39,7 @@ target_link_libraries(ReplayKeeper PRIVATE
     dwmapi
     winhttp
     shell32
+    ole32
+    windowscodecs
     ntdll
 )

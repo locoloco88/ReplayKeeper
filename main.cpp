@@ -202,6 +202,77 @@ bool CopyFileWithOverwrite(const std::wstring& source, const std::wstring& desti
     return CopyFileW(source.c_str(), destination.c_str(), FALSE) != 0;
 }
 
+static bool PatchSystemYamlContent(std::string& content) {
+    bool changed = false;
+
+    const std::string targetUrl = "https://sieve.services.riotcdn.net";
+    const std::string replacement = "EXPIREDREPLAY";
+    size_t urlPos = 0;
+    while ((urlPos = content.find(targetUrl, urlPos)) != std::string::npos) {
+        content.replace(urlPos, targetUrl.length(), replacement);
+        urlPos += replacement.length();
+        changed = true;
+    }
+
+    const std::string key = "game_patcher:";
+    std::string patched;
+    patched.reserve(content.size());
+
+    size_t lineStart = 0;
+    while (lineStart < content.size()) {
+        size_t lineBreak = content.find('\n', lineStart);
+        size_t lineEnd = (lineBreak == std::string::npos) ? content.size() : lineBreak;
+        size_t logicalEnd = lineEnd;
+        bool hasCr = logicalEnd > lineStart && content[logicalEnd - 1] == '\r';
+        if (hasCr) logicalEnd--;
+
+        size_t firstNonSpace = lineStart;
+        while (firstNonSpace < logicalEnd && (content[firstNonSpace] == ' ' || content[firstNonSpace] == '\t')) {
+            firstNonSpace++;
+        }
+
+        if (logicalEnd - firstNonSpace >= key.length() && content.compare(firstNonSpace, key.length(), key) == 0) {
+            patched.append(content, lineStart, firstNonSpace - lineStart);
+            patched += "game_patcher: ";
+            if (hasCr) patched += '\r';
+            if (lineBreak != std::string::npos) patched += '\n';
+        } else {
+            patched.append(content, lineStart, lineEnd - lineStart);
+            if (lineBreak != std::string::npos) patched += '\n';
+        }
+
+        if (lineBreak == std::string::npos) break;
+        lineStart = lineBreak + 1;
+    }
+
+    if (patched != content) {
+        content = patched;
+        changed = true;
+    }
+
+    return changed;
+}
+
+bool PatchSystemYamlFile(const std::wstring& filePath) {
+    if (!fs::exists(filePath)) return false;
+
+    std::ifstream inFile(filePath.c_str(), std::ios::binary);
+    if (!inFile.is_open()) return false;
+
+    std::string content((std::istreambuf_iterator<char>(inFile)),
+                         std::istreambuf_iterator<char>());
+    inFile.close();
+
+    if (!PatchSystemYamlContent(content)) return true;
+
+    std::ofstream outFile(filePath.c_str(), std::ios::binary | std::ios::trunc);
+    if (!outFile.is_open()) return false;
+
+    outFile.write(content.data(), content.size());
+    outFile.close();
+    return true;
+}
+
 static std::string ExtractPatchFromFile(const std::wstring& filePath) {
     if (!fs::exists(filePath)) return "";
 
@@ -335,11 +406,13 @@ void CopyAllFiles() {
     std::wstring compatMetadataDest = gamePath + L"\\compat-version-metadata.json";
 
     bool success = true;
+    success &= PatchSystemYamlFile(systemYamlSource);
     success &= CopyFileWithOverwrite(systemYamlSource, systemYamlDest);
     success &= CopyFileWithOverwrite(compatMetadataSource, compatMetadataDest);
 
     if (success) {
         g_guiState.filesCopied.store(true);
+        g_guiState.copyNoticePending.store(true);
         g_guiState.monitorEnabled.store(false);
     }
 }
@@ -419,31 +492,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 }
             }
 
-            if (fs::exists(localSystemYaml)) {
-                std::ifstream inFile(localSystemYaml.c_str(), std::ios::binary);
-                if (inFile.is_open()) {
-                    std::vector<char> buffer((std::istreambuf_iterator<char>(inFile)),
-                                              std::istreambuf_iterator<char>());
-                    inFile.close();
-
-                    std::string content(buffer.begin(), buffer.end());
-
-                    const std::string targetUrl = "https://sieve.services.riotcdn.net";
-                    const std::string replacement = "EXPIREDREPLAY";
-
-                    size_t pos = content.find(targetUrl);
-                    if (pos != std::string::npos) {
-                        content.replace(pos, targetUrl.length(), replacement);
-
-                        std::ofstream outFile(localSystemYaml.c_str(), std::ios::binary | std::ios::trunc);
-                        if (outFile.is_open()) {
-                            outFile.write(content.data(), content.size());
-                            outFile.close();
-                        }
-                    }
-                }
-            }
-
             std::wstring localCompatMetadata = exeDir + L"\\compat-version-metadata.json";
             std::wstring leagueCompatMetadata = g_guiState.leagueInstallPath + L"\\Game\\compat-version-metadata.json";
 
@@ -455,6 +503,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 }
             }
         }
+
+        PatchSystemYamlFile(exeDir + L"\\system.yaml");
         
         g_guiState.gameFolderPatchVersion = ReadGameFolderPatchVersion();
         g_guiState.currentPatchVersion = ReadCurrentPatchVersion();

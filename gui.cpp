@@ -1,5 +1,6 @@
 #include "gui.hpp"
 #include "lcu.hpp"
+#include "image_resources.hpp"
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
@@ -7,7 +8,10 @@
 #include <fstream>
 #include <vector>
 #include <algorithm>
+#include <future>
+#include <chrono>
 #include <shlobj.h>
+#include <wincodec.h>
 
 namespace fs = std::filesystem;
 
@@ -23,6 +27,7 @@ std::wstring GetExeDirectoryW();
 std::string ReadCurrentPatchVersion();
 std::string ReadGameFolderPatchVersion();
 bool ApplyPatchToLocalFile(const char* patchInput);
+bool PatchSystemYamlFile(const std::wstring& filePath);
 int KillAllRiotProcesses();
 bool LaunchRiotClient(const std::wstring& riotClientDir);
 
@@ -35,20 +40,7 @@ static void TryCopyStartupFiles(const std::wstring& leaguePath) {
     if (!fs::exists(localSystemYaml) && fs::exists(leagueSystemYaml)) {
         try { fs::copy_file(leagueSystemYaml, localSystemYaml, fs::copy_options::overwrite_existing); } catch (...) {}
     }
-    if (fs::exists(localSystemYaml)) {
-        std::ifstream inFile(localSystemYaml.c_str(), std::ios::binary);
-        if (inFile.is_open()) {
-            std::string content((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
-            inFile.close();
-            const std::string targetUrl = "https://sieve.services.riotcdn.net";
-            size_t pos = content.find(targetUrl);
-            if (pos != std::string::npos) {
-                content.replace(pos, targetUrl.length(), "EXPIREDREPLAY");
-                std::ofstream outFile(localSystemYaml.c_str(), std::ios::binary | std::ios::trunc);
-                if (outFile.is_open()) { outFile.write(content.data(), content.size()); outFile.close(); }
-            }
-        }
-    }
+    PatchSystemYamlFile(localSystemYaml);
 
     std::wstring localCompat = exeDir + L"\\compat-version-metadata.json";
     std::wstring leagueCompat = leaguePath + L"\\Game\\compat-version-metadata.json";
@@ -65,6 +57,26 @@ static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain* g_pSwapChain = nullptr;
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 static HWND g_hwnd = nullptr;
+static bool g_comInitialized = false;
+
+struct NoticeImage {
+    ID3D11ShaderResourceView* texture = nullptr;
+    int width = 0;
+    int height = 0;
+};
+
+struct DownloadReplayResult {
+    LcuCredentials creds;
+    std::string gameId;
+    std::string result;
+};
+
+static NoticeImage g_noticeImages[3];
+static bool g_noticeImagesLoaded = false;
+static bool g_copyNoticeSettingsLoaded = false;
+static bool g_copyNoticeDisabled = false;
+static bool g_copyNoticeOpen = false;
+static bool g_copyNoticeDisableChecked = false;
 
 GuiState g_guiState;
 
@@ -72,11 +84,301 @@ static bool CreateDeviceD3D(HWND hWnd);
 static void CleanupDeviceD3D();
 static void CreateRenderTarget();
 static void CleanupRenderTarget();
+static void RenderCopyNoticeModal(float scale);
+static void CleanupNoticeImages();
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
+static std::wstring CopyNoticeSettingsPath() {
+    return GetExeDirectoryW() + L"\\ReplayKeeperSettings.settings";
+}
+
+static bool LoadCopyNoticeDisabled() {
+    std::ifstream inFile(CopyNoticeSettingsPath().c_str(), std::ios::binary);
+    if (!inFile.is_open()) return false;
+
+    char value = 0;
+    inFile.read(&value, 1);
+    inFile.close();
+    return value == '1';
+}
+
+static void SaveCopyNoticeDisabled() {
+    std::ofstream outFile(CopyNoticeSettingsPath().c_str(), std::ios::binary | std::ios::trunc);
+    if (!outFile.is_open()) return;
+
+    outFile.write("1", 1);
+    outFile.close();
+}
+
+static bool LoadTextureFromMemory(const unsigned char* data, size_t size, NoticeImage& image) {
+    if (!data || size == 0 || size > 0xffffffffu) return false;
+
+    IWICImagingFactory* factory = nullptr;
+    IWICStream* stream = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (SUCCEEDED(hr)) hr = factory->CreateStream(&stream);
+    if (SUCCEEDED(hr)) hr = stream->InitializeFromMemory((BYTE*)data, (DWORD)size);
+    if (SUCCEEDED(hr)) hr = factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnLoad, &decoder);
+    if (SUCCEEDED(hr)) hr = decoder->GetFrame(0, &frame);
+    if (SUCCEEDED(hr)) hr = factory->CreateFormatConverter(&converter);
+    if (SUCCEEDED(hr)) {
+        hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom);
+    }
+
+    UINT width = 0;
+    UINT height = 0;
+    if (SUCCEEDED(hr)) hr = converter->GetSize(&width, &height);
+
+    std::vector<unsigned char> pixels;
+    if (SUCCEEDED(hr)) {
+        pixels.resize((size_t)width * (size_t)height * 4);
+        hr = converter->CopyPixels(nullptr, width * 4, (UINT)pixels.size(), pixels.data());
+    }
+
+    ID3D11Texture2D* texture = nullptr;
+    if (SUCCEEDED(hr)) {
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA subResource = {};
+        subResource.pSysMem = pixels.data();
+        subResource.SysMemPitch = width * 4;
+
+        hr = g_pd3dDevice->CreateTexture2D(&desc, &subResource, &texture);
+    }
+
+    if (SUCCEEDED(hr)) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        hr = g_pd3dDevice->CreateShaderResourceView(texture, &srvDesc, &image.texture);
+    }
+
+    if (texture) texture->Release();
+    if (converter) converter->Release();
+    if (frame) frame->Release();
+    if (decoder) decoder->Release();
+    if (stream) stream->Release();
+    if (factory) factory->Release();
+
+    if (FAILED(hr)) return false;
+
+    image.width = (int)width;
+    image.height = (int)height;
+    return true;
+}
+
+static void LoadNoticeImages() {
+    if (g_noticeImagesLoaded) return;
+    g_noticeImagesLoaded = true;
+
+    for (int i = 0; i < 3; i++) {
+        EmbeddedImageResource resource = GetNoticeImageResource(i);
+        LoadTextureFromMemory(resource.data, resource.size, g_noticeImages[i]);
+    }
+}
+
+static void CleanupNoticeImages() {
+    for (auto& image : g_noticeImages) {
+        if (image.texture) {
+            image.texture->Release();
+            image.texture = nullptr;
+        }
+        image.width = 0;
+        image.height = 0;
+    }
+    g_noticeImagesLoaded = false;
+}
+
+static void DrawNoticeImage(const NoticeImage& image, float maxWidth, float maxHeight) {
+    if (!image.texture || image.width <= 0 || image.height <= 0) {
+        ImGui::TextDisabled("Image unavailable");
+        return;
+    }
+
+    float width = (float)image.width;
+    float height = (float)image.height;
+    float ratio = width / height;
+
+    if (width > maxWidth) {
+        width = maxWidth;
+        height = width / ratio;
+    }
+    if (height > maxHeight) {
+        height = maxHeight;
+        width = height * ratio;
+    }
+
+    ImGui::Image((ImTextureID)image.texture, ImVec2(width, height));
+}
+
+static void SetCopyNoticeTopMost(bool enabled) {
+    if (!g_hwnd) return;
+
+    if (enabled) {
+        ShowWindow(g_hwnd, SW_RESTORE);
+        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetForegroundWindow(g_hwnd);
+    } else {
+        SetWindowPos(g_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    }
+}
+
+static void RenderNoticeTextAndImage(const char* text, NoticeImage& image, float textWidth, float imageWidth, float imageHeight) {
+    ImGui::BeginGroup();
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + textWidth);
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopTextWrapPos();
+    ImGui::EndGroup();
+
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    DrawNoticeImage(image, imageWidth, imageHeight);
+    ImGui::EndGroup();
+}
+
+static void RenderCopyNoticeModal(float scale) {
+    if (!g_copyNoticeSettingsLoaded) {
+        g_copyNoticeDisabled = LoadCopyNoticeDisabled();
+        g_copyNoticeSettingsLoaded = true;
+    }
+
+    if (g_guiState.copyNoticePending.exchange(false)) {
+        if (!g_copyNoticeDisabled) {
+            LoadNoticeImages();
+            g_copyNoticeOpen = true;
+            g_copyNoticeDisableChecked = false;
+            SetCopyNoticeTopMost(true);
+            ImGui::OpenPopup("Replay Keeper Notice");
+        }
+    }
+
+    if (!g_copyNoticeOpen) return;
+    ImGui::OpenPopup("Replay Keeper Notice");
+
+    ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+    float modalWidth = displaySize.x * 0.88f;
+    if (modalWidth > 920.0f * scale) modalWidth = 920.0f * scale;
+    if (modalWidth < 360.0f) modalWidth = 360.0f;
+
+    float modalHeight = displaySize.y * 0.82f;
+    if (modalHeight > 720.0f * scale) modalHeight = 720.0f * scale;
+    if (modalHeight < 420.0f) modalHeight = displaySize.y * 0.92f;
+
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(modalWidth, modalHeight), ImGuiCond_Always);
+    ImGui::SetNextWindowFocus();
+
+    if (ImGui::BeginPopupModal("Replay Keeper Notice", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove)) {
+        float contentWidth = ImGui::GetContentRegionAvail().x;
+        float footerHeight = 78.0f * scale;
+        float bodyHeight = ImGui::GetContentRegionAvail().y - footerHeight;
+        if (bodyHeight < 220.0f) bodyHeight = 220.0f;
+
+        ImGui::BeginChild("ReplayNoticeBody", ImVec2(-1, bodyHeight), false);
+
+        float gap = 18.0f * scale;
+        float imageWidth = contentWidth * 0.42f;
+        if (imageWidth > 360.0f * scale) imageWidth = 360.0f * scale;
+        if (imageWidth < 150.0f) imageWidth = 150.0f;
+        float textWidth = contentWidth - imageWidth - gap;
+        if (textWidth < 180.0f) {
+            textWidth = contentWidth;
+            imageWidth = contentWidth;
+        }
+
+        const char* firstText = "In the showcase video, I said the \"Play\" button had to be greyed out. Due to a Riot Games change in patch 16.11 / 26.11, it will no longer look like this.";
+        const char* secondText = "From now on, this is what it looks like when everything is working correctly.";
+
+        if (textWidth >= contentWidth - 1.0f) {
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + contentWidth);
+            ImGui::TextWrapped("%s", firstText);
+            ImGui::PopTextWrapPos();
+            DrawNoticeImage(g_noticeImages[0], imageWidth, 210.0f * scale);
+        } else {
+            RenderNoticeTextAndImage(firstText, g_noticeImages[0], textWidth, imageWidth, 210.0f * scale);
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        float pairGap = 12.0f * scale;
+        float pairGroupWidth = contentWidth * 0.58f;
+        float secondTextWidth = contentWidth - pairGroupWidth - gap;
+        if (secondTextWidth >= 180.0f && pairGroupWidth >= 300.0f) {
+            ImGui::BeginGroup();
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + secondTextWidth);
+            ImGui::TextWrapped("%s", secondText);
+            ImGui::PopTextWrapPos();
+            ImGui::EndGroup();
+
+            ImGui::SameLine();
+            ImGui::BeginGroup();
+            float pairWidth = (pairGroupWidth - pairGap) * 0.5f;
+            DrawNoticeImage(g_noticeImages[1], pairWidth, 220.0f * scale);
+            ImGui::SameLine();
+            DrawNoticeImage(g_noticeImages[2], pairWidth, 220.0f * scale);
+            ImGui::EndGroup();
+        } else {
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + contentWidth);
+            ImGui::TextWrapped("%s", secondText);
+            ImGui::PopTextWrapPos();
+            ImGui::Spacing();
+            float pairWidth = (contentWidth - pairGap) * 0.5f;
+            if (pairWidth < 150.0f) pairWidth = contentWidth;
+            DrawNoticeImage(g_noticeImages[1], pairWidth, 220.0f * scale);
+            if (pairWidth < contentWidth - 1.0f) {
+                ImGui::SameLine();
+                DrawNoticeImage(g_noticeImages[2], pairWidth, 220.0f * scale);
+            } else {
+                DrawNoticeImage(g_noticeImages[2], pairWidth, 220.0f * scale);
+            }
+        }
+
+        ImGui::EndChild();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::Checkbox("Dont show this notification anymore", &g_copyNoticeDisableChecked);
+
+        float buttonWidth = 220.0f * scale;
+        if (buttonWidth > contentWidth) buttonWidth = contentWidth;
+        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - buttonWidth) * 0.5f);
+        if (ImGui::Button("I UNDERSTAND", ImVec2(buttonWidth, 34.0f * scale))) {
+            if (g_copyNoticeDisableChecked) {
+                g_copyNoticeDisabled = true;
+                SaveCopyNoticeDisabled();
+            }
+            g_copyNoticeOpen = false;
+            SetCopyNoticeTopMost(false);
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
 bool InitializeGui(const wchar_t* title, int width, int height) {
+    HRESULT coResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (SUCCEEDED(coResult)) {
+        g_comInitialized = true;
+    }
+
     WNDCLASSEXW wc = {
         sizeof(wc),
         CS_CLASSDC,
@@ -101,6 +403,10 @@ bool InitializeGui(const wchar_t* title, int width, int height) {
     if (!CreateDeviceD3D(g_hwnd)) {
         CleanupDeviceD3D();
         UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        if (g_comInitialized) {
+            CoUninitialize();
+            g_comInitialized = false;
+        }
         return false;
     }
 
@@ -147,7 +453,7 @@ void RunGuiLoop() {
 
         ImVec2 displaySize = ImGui::GetIO().DisplaySize;
         float scaleX = displaySize.x / 900.0f;
-        float scaleY = displaySize.y / 550.0f;
+        float scaleY = displaySize.y / 730.0f;
         float scale = (scaleX < scaleY) ? scaleX : scaleY;
         if (scale < 0.5f) scale = 0.5f;
         if (scale > 2.0f) scale = 2.0f;
@@ -173,10 +479,13 @@ void RunGuiLoop() {
         programTime += ImGui::GetIO().DeltaTime;
 
         float windowWidth = ImGui::GetContentRegionAvail().x;
-        float leftColumnWidth = windowWidth * 0.55f;
-        float rightColumnWidth = windowWidth * 0.42f;
+        float windowHeight = ImGui::GetContentRegionAvail().y;
+        bool stackColumns = windowWidth < 820.0f;
+        float leftColumnWidth = stackColumns ? windowWidth : windowWidth * 0.55f;
+        float rightColumnWidth = stackColumns ? windowWidth : windowWidth * 0.42f;
+        float leftColumnHeight = stackColumns ? windowHeight * 0.58f : 0.0f;
 
-        ImGui::BeginChild("LeftColumn", ImVec2(leftColumnWidth, 0), false);
+        ImGui::BeginChild("LeftColumn", ImVec2(leftColumnWidth, leftColumnHeight), false);
 
         ImGui::PushFont(nullptr);
         ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Replay Keeper");
@@ -188,7 +497,7 @@ void RunGuiLoop() {
             ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "League Detected");
 
             std::string pathStr = WideToUtf8(g_guiState.leagueInstallPath);
-            ImGui::Text("Path: %s", pathStr.c_str());
+            ImGui::TextWrapped("Path: %s", pathStr.c_str());
             
             if (g_guiState.pathFromRegistry) {
                 ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "(Auto-detected)");
@@ -245,7 +554,7 @@ void RunGuiLoop() {
         if (!g_guiState.riotClientPath.empty()) {
             ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Riot Client Detected");
             std::string riotPathStr = WideToUtf8(g_guiState.riotClientPath);
-            ImGui::Text("Path: %s", riotPathStr.c_str());
+            ImGui::TextWrapped("Path: %s", riotPathStr.c_str());
 
             if (g_guiState.riotClientPathFromRegistry) {
                 ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "(Auto-detected)");
@@ -351,28 +660,7 @@ void RunGuiLoop() {
                             }
                         }
 
-                        if (fs::exists(localSystemYaml)) {
-                            std::ifstream inFile(localSystemYaml.c_str(), std::ios::binary);
-                            if (inFile.is_open()) {
-                                std::vector<char> buffer((std::istreambuf_iterator<char>(inFile)),
-                                                          std::istreambuf_iterator<char>());
-                                inFile.close();
-                                
-                                std::string content(buffer.begin(), buffer.end());
-                                const std::string targetUrl = "https://sieve.services.riotcdn.net";
-                                const std::string replacement = "EXPIREDREPLAY";
-                                
-                                size_t pos = content.find(targetUrl);
-                                if (pos != std::string::npos) {
-                                    content.replace(pos, targetUrl.length(), replacement);
-                                    std::ofstream outFile(localSystemYaml.c_str(), std::ios::binary | std::ios::trunc);
-                                    if (outFile.is_open()) {
-                                        outFile.write(content.data(), content.size());
-                                        outFile.close();
-                                    }
-                                }
-                            }
-                        }
+                        PatchSystemYamlFile(localSystemYaml);
 
                         {
                             wchar_t exePath[MAX_PATH];
@@ -395,6 +683,7 @@ void RunGuiLoop() {
                             g_guiState.gameFolderPatchVersion = ReadGameFolderPatchVersion();
                         }
                         
+                        g_guiState.filesCopied.store(false);
                         g_guiState.monitorEnabled.store(true);
                     }
                 }
@@ -469,7 +758,13 @@ void RunGuiLoop() {
 
         ImGui::EndChild();
 
-        ImGui::SameLine();
+        if (stackColumns) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+        } else {
+            ImGui::SameLine();
+        }
         ImGui::BeginChild("RightColumn", ImVec2(rightColumnWidth, 0), true);
 
         ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Replay Downloader");
@@ -483,22 +778,39 @@ void RunGuiLoop() {
         ImGui::Spacing();
 
         static LcuCredentials cachedCreds;
+        static std::future<DownloadReplayResult> downloadReplayFuture;
+        static bool downloadReplayInProgress = false;
 
+        if (downloadReplayInProgress && downloadReplayFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            DownloadReplayResult downloadResult = downloadReplayFuture.get();
+            cachedCreds = downloadResult.creds;
+            g_guiState.consoleLogs += "> " + downloadResult.result + "\n";
+
+            if (downloadResult.result.find("Downloading") != std::string::npos) {
+                g_guiState.downloadingGameId = downloadResult.gameId;
+                g_guiState.lastDownloadCheckTime = programTime;
+            }
+
+            downloadReplayInProgress = false;
+        }
+
+        ImGui::BeginDisabled(downloadReplayInProgress);
         if (ImGui::Button("Download Replay", ImVec2(-1, 28 * scale))) {
             std::string gameId = g_guiState.gameIdInput;
             if (gameId.empty()) {
                 g_guiState.consoleLogs += "> Enter a GameID first\n";
             } else {
-                cachedCreds = ConnectToLcu();
-                std::string result = DownloadReplay(cachedCreds, gameId);
-                g_guiState.consoleLogs += "> " + result + "\n";
-                
-                if (result.find("Downloading") != std::string::npos) {
-                    g_guiState.downloadingGameId = gameId;
-                    g_guiState.lastDownloadCheckTime = programTime;
-                }
+                downloadReplayInProgress = true;
+                downloadReplayFuture = std::async(std::launch::async, [gameId]() {
+                    DownloadReplayResult downloadResult;
+                    downloadResult.gameId = gameId;
+                    downloadResult.creds = ConnectToLcu();
+                    downloadResult.result = DownloadReplay(downloadResult.creds, gameId);
+                    return downloadResult;
+                });
             }
         }
+        ImGui::EndDisabled();
 
         if (ImGui::Button("Watch Replay", ImVec2(-1, 28 * scale))) {
             std::string gameId = g_guiState.gameIdInput;
@@ -551,13 +863,21 @@ void RunGuiLoop() {
         }
 
         ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-        ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-        ImGui::SetNextWindowSize(ImVec2(350, 400), ImGuiCond_Appearing);
+        float replayPopupWidth = displaySize.x * 0.62f;
+        if (replayPopupWidth < 320.0f) replayPopupWidth = 320.0f;
+        if (replayPopupWidth > 560.0f * scale) replayPopupWidth = 560.0f * scale;
+        float replayPopupHeight = displaySize.y * 0.72f;
+        if (replayPopupHeight < 300.0f) replayPopupHeight = 300.0f;
+        if (replayPopupHeight > 620.0f * scale) replayPopupHeight = 620.0f * scale;
+        ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(replayPopupWidth, replayPopupHeight), ImGuiCond_Always);
         
         if (ImGui::BeginPopupModal("Replay Browser", &showReplayBrowser, ImGuiWindowFlags_NoResize)) {
             ImGui::Text("Search:");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-1);
+            if (ImGui::GetContentRegionAvail().x > 260.0f * scale) {
+                ImGui::SameLine();
+            }
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
             ImGui::InputText("##Search", searchFilter, sizeof(searchFilter));
             
             ImGui::Spacing();
@@ -566,7 +886,8 @@ void RunGuiLoop() {
 
             ImGui::Text("Available Replays (%d):", (int)availableReplays.size());
             
-            float listHeight = ImGui::GetContentRegionAvail().y - 40;
+            float listHeight = ImGui::GetContentRegionAvail().y - 40.0f * scale;
+            if (listHeight < 120.0f) listHeight = 120.0f;
             ImGui::BeginChild("ReplayList", ImVec2(-1, listHeight), true);
             
             std::string filterStr = searchFilter;
@@ -592,7 +913,9 @@ void RunGuiLoop() {
             
             ImGui::Spacing();
 
-            if (ImGui::Button("Select", ImVec2(100, 0))) {
+            float popupButtonWidth = 100.0f * scale;
+            if (popupButtonWidth < 86.0f) popupButtonWidth = 86.0f;
+            if (ImGui::Button("Select", ImVec2(popupButtonWidth, 0))) {
                 if (selectedReplayIdx >= 0 && selectedReplayIdx < (int)availableReplays.size()) {
                     strncpy(g_guiState.gameIdInput, availableReplays[selectedReplayIdx].c_str(), sizeof(g_guiState.gameIdInput) - 1);
                     g_guiState.gameIdInput[sizeof(g_guiState.gameIdInput) - 1] = '\0';
@@ -600,8 +923,10 @@ void RunGuiLoop() {
                 showReplayBrowser = false;
                 ImGui::CloseCurrentPopup();
             }
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel", ImVec2(100, 0))) {
+            if (ImGui::GetContentRegionAvail().x > popupButtonWidth + style.ItemSpacing.x) {
+                ImGui::SameLine();
+            }
+            if (ImGui::Button("Cancel", ImVec2(popupButtonWidth, 0))) {
                 showReplayBrowser = false;
                 ImGui::CloseCurrentPopup();
             }
@@ -615,7 +940,8 @@ void RunGuiLoop() {
 
         ImGui::Text("Console:");
         
-        float consoleHeight = ImGui::GetContentRegionAvail().y - 10 * scale;
+        float consoleHeight = ImGui::GetContentRegionAvail().y - 10.0f * scale;
+        if (consoleHeight < 120.0f) consoleHeight = 120.0f;
         ImGui::BeginChild("ConsoleLog", ImVec2(-1, consoleHeight), true, 
             ImGuiWindowFlags_HorizontalScrollbar);
         
@@ -629,12 +955,17 @@ void RunGuiLoop() {
         ImGui::EndChild();
         ImGui::End();
 
+        RenderCopyNoticeModal(scale);
+
         if (!g_guiState.notificationMessage.empty() && programTime < g_guiState.notificationEndTime) {
             ImVec2 displaySize = ImGui::GetIO().DisplaySize;
-            float padding = 10.0f;
-            float textPadding = 12.0f;
+            float padding = 10.0f * scale;
+            float textPadding = 12.0f * scale;
+            float maxTextWidth = displaySize.x - padding * 2.0f - textPadding * 2.0f;
+            if (maxTextWidth > 420.0f * scale) maxTextWidth = 420.0f * scale;
+            if (maxTextWidth < 160.0f) maxTextWidth = displaySize.x - padding * 2.0f - textPadding * 2.0f;
 
-            ImVec2 textSize = ImGui::CalcTextSize(g_guiState.notificationMessage.c_str());
+            ImVec2 textSize = ImGui::CalcTextSize(g_guiState.notificationMessage.c_str(), nullptr, false, maxTextWidth);
             float notifyWidth = textSize.x + textPadding * 2;
             float notifyHeight = textSize.y + textPadding * 2;
             
@@ -658,7 +989,7 @@ void RunGuiLoop() {
             drawList->AddRect(boxMin, boxMax, borderColor, 6.0f, 0, 2.0f);
 
             ImVec2 textPos(boxMin.x + textPadding, boxMin.y + textPadding);
-            drawList->AddText(textPos, textColor, g_guiState.notificationMessage.c_str());
+            drawList->AddText(ImGui::GetFont(), ImGui::GetFontSize(), textPos, textColor, g_guiState.notificationMessage.c_str(), nullptr, maxTextWidth);
         } else if (programTime >= g_guiState.notificationEndTime) {
             g_guiState.notificationMessage.clear();
         }
@@ -672,12 +1003,18 @@ void RunGuiLoop() {
 }
 
 void CleanupGui() {
+    SetCopyNoticeTopMost(false);
+    CleanupNoticeImages();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     CleanupDeviceD3D();
     DestroyWindow(g_hwnd);
     UnregisterClassW(L"SleeperGuiClass", GetModuleHandle(nullptr));
+    if (g_comInitialized) {
+        CoUninitialize();
+        g_comInitialized = false;
+    }
 }
 
 static bool CreateDeviceD3D(HWND hWnd) {
@@ -737,6 +1074,13 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return true;
 
     switch (msg) {
+    case WM_GETMINMAXINFO:
+        {
+            MINMAXINFO* info = (MINMAXINFO*)lParam;
+            info->ptMinTrackSize.x = 720;
+            info->ptMinTrackSize.y = 560;
+        }
+        return 0;
     case WM_SIZE:
         if (g_pd3dDevice != nullptr && wParam != SIZE_MINIMIZED) {
             CleanupRenderTarget();
