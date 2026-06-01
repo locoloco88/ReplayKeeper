@@ -5,6 +5,10 @@
 #include <string>
 #include <atomic>
 #include <mutex>
+#include <memory>
+#include <vector>
+
+#include "manifest_catalog.hpp"
 
 struct GuiState {
     std::mutex mtx;
@@ -30,6 +34,18 @@ struct GuiState {
     char patchVersionInput[32] = "";
     std::string currentPatchVersion;
     std::string gameFolderPatchVersion;
+
+    std::vector<std::string> patchServers;
+    std::vector<manifest_catalog::PatchEntry> patchEntries;
+    int selectedPatchServer = -1;
+    int selectedPatchEntry = -1;
+    std::wstring patchOutputFolder;
+    int selectedPatchLanguage = 0;
+    std::string patchDownloaderStatus;
+    std::string patchDownloaderProgress;
+    bool patchDownloadInProgress = false;
+    bool patchCatalogInProgress = false;
+    std::shared_ptr<std::atomic_bool> patchDownloadCancelFlag;
 };
 
 extern GuiState g_guiState;

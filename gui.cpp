@@ -1,6 +1,8 @@
 #include "gui.hpp"
 #include "lcu.hpp"
 #include "image_resources.hpp"
+#include "patch_downloader.hpp"
+#include "patch_catalog_ui.hpp"
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
@@ -8,6 +10,7 @@
 #include <fstream>
 #include <vector>
 #include <algorithm>
+#include <cstring>
 #include <future>
 #include <chrono>
 #include <shlobj.h>
@@ -21,6 +24,12 @@ static std::string WideToUtf8(const std::wstring& wstr) {
     std::string result(size, 0);
     WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), &result[0], size, nullptr, nullptr);
     return result;
+}
+
+static std::string CompactPathForDisplay(const std::string& path, size_t maxLength) {
+    if (path.size() <= maxLength) return path;
+    if (maxLength <= 6) return path.substr(path.size() - maxLength);
+    return "..." + path.substr(path.size() - (maxLength - 3));
 }
 
 std::wstring GetExeDirectoryW();
@@ -52,6 +61,20 @@ static void TryCopyStartupFiles(const std::wstring& leaguePath) {
     g_guiState.gameFolderPatchVersion = ReadGameFolderPatchVersion();
 }
 
+static bool SelectFolder(const wchar_t* title, std::wstring& outPath) {
+    BROWSEINFOW bi = {0};
+    bi.lpszTitle = title;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) return false;
+
+    wchar_t path[MAX_PATH];
+    bool selected = SHGetPathFromIDListW(pidl, path) != FALSE;
+    if (selected) outPath = path;
+    CoTaskMemFree(pidl);
+    return selected;
+}
+
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain* g_pSwapChain = nullptr;
@@ -69,6 +92,11 @@ struct DownloadReplayResult {
     LcuCredentials creds;
     std::string gameId;
     std::string result;
+};
+
+struct PatchDownloadTaskResult {
+    patch_downloader::Result result;
+    std::string patchVersion;
 };
 
 static NoticeImage g_noticeImages[3];
@@ -766,6 +794,7 @@ void RunGuiLoop() {
             ImGui::SameLine();
         }
         ImGui::BeginChild("RightColumn", ImVec2(rightColumnWidth, 0), true);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(style.ItemSpacing.x, 5.0f * scale));
 
         ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Replay Downloader");
         ImGui::Separator();
@@ -938,10 +967,296 @@ void RunGuiLoop() {
         ImGui::Separator();
         ImGui::Spacing();
 
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Patch Downloader");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        static std::future<manifest_catalog::ServerListResult> patchServersFuture;
+        static std::future<manifest_catalog::PatchListResult> patchListFuture;
+        static std::future<PatchDownloadTaskResult> patchDownloadFuture;
+        static bool patchServersLoading = false;
+        static bool patchListLoading = false;
+        static bool patchServersAutoLoadStarted = false;
+        static char patchSearchFilter[64] = "";
+        static const char* patchLanguages[] = {
+            "en_US", "de_DE", "ar_AE", "cs_CZ", "el_GR", "es_ES", "es_MX", "fr_FR",
+            "hu_HU", "it_IT", "ja_JP", "ko_KR", "pl_PL", "pt_BR", "ro_RO", "ru_RU",
+            "th_TH", "tr_TR", "vi_VN", "zh_CN", "zh_TW"
+        };
+        constexpr int patchLanguageCount = (int)(sizeof(patchLanguages) / sizeof(patchLanguages[0]));
+
+        auto startPatchServerLoad = [&]() {
+            patchServersLoading = true;
+            patchServersAutoLoadStarted = true;
+            g_guiState.patchCatalogInProgress = true;
+            g_guiState.patchDownloaderStatus = "Loading servers...";
+            patchServersFuture = std::async(std::launch::async, []() {
+                return manifest_catalog::FetchLeagueServers();
+            });
+        };
+
+        auto startPatchListLoad = [&](const std::string& server) {
+            patchListLoading = true;
+            g_guiState.patchCatalogInProgress = true;
+            g_guiState.patchDownloaderStatus = "Loading patches for " + server + "...";
+            patchListFuture = std::async(std::launch::async, [server]() {
+                return manifest_catalog::FetchLeaguePatches(server);
+            });
+        };
+
+        if (!patchServersAutoLoadStarted) {
+            startPatchServerLoad();
+        }
+
+        if (patchServersLoading && patchServersFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            manifest_catalog::ServerListResult result = patchServersFuture.get();
+            patchServersLoading = false;
+            g_guiState.patchCatalogInProgress = patchListLoading;
+            if (result.success) {
+                g_guiState.patchServers = result.servers;
+                g_guiState.selectedPatchServer = patch_catalog_ui::SelectionAfterServerLoad((int)g_guiState.patchServers.size());
+                g_guiState.patchEntries.clear();
+                g_guiState.selectedPatchEntry = -1;
+                g_guiState.patchDownloaderStatus = "Loaded " + std::to_string(result.servers.size()) + " server(s). Select a server.";
+                g_guiState.consoleLogs += "> Patch servers loaded\n";
+            } else {
+                g_guiState.patchDownloaderStatus = result.error;
+                g_guiState.consoleLogs += "> " + result.error + "\n";
+            }
+        }
+
+        if (patchListLoading && patchListFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            manifest_catalog::PatchListResult result = patchListFuture.get();
+            patchListLoading = false;
+            g_guiState.patchCatalogInProgress = patchServersLoading;
+            if (result.success) {
+                g_guiState.patchEntries = result.patches;
+                g_guiState.selectedPatchEntry = g_guiState.patchEntries.empty() ? -1 : 0;
+                patchSearchFilter[0] = '\0';
+                g_guiState.patchDownloaderStatus = "Loaded " + std::to_string(result.patches.size()) + " patch(es)";
+                g_guiState.consoleLogs += "> Patch list loaded\n";
+            } else {
+                g_guiState.patchDownloaderStatus = result.error;
+                g_guiState.consoleLogs += "> " + result.error + "\n";
+            }
+        }
+
+        if (g_guiState.patchDownloadInProgress && patchDownloadFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            PatchDownloadTaskResult taskResult = patchDownloadFuture.get();
+            g_guiState.patchDownloadInProgress = false;
+            g_guiState.patchDownloadCancelFlag.reset();
+
+            if (taskResult.result.success) {
+                g_guiState.patchDownloaderStatus = taskResult.result.message;
+                g_guiState.notificationMessage = "Patch download complete";
+                g_guiState.notificationIsSuccess = true;
+            } else if (taskResult.result.cancelled) {
+                g_guiState.patchDownloaderStatus = "Download cancelled";
+                g_guiState.notificationMessage = "Patch download cancelled";
+                g_guiState.notificationIsSuccess = false;
+            } else {
+                g_guiState.patchDownloaderStatus = taskResult.result.message;
+                g_guiState.notificationMessage = "Patch download failed";
+                g_guiState.notificationIsSuccess = false;
+            }
+            g_guiState.notificationEndTime = programTime + 3.0f;
+            g_guiState.consoleLogs += "> Patch " + taskResult.patchVersion + ": " + g_guiState.patchDownloaderStatus + "\n";
+        }
+
+        const float compactButtonHeight = 24.0f * scale;
+        bool catalogBusy = patchServersLoading || patchListLoading || g_guiState.patchDownloadInProgress;
+        if (patchServersLoading) {
+            ImGui::TextDisabled("Loading servers...");
+        }
+
+        const char* selectedServerName = "Select server";
+        if (g_guiState.selectedPatchServer >= 0 && g_guiState.selectedPatchServer < (int)g_guiState.patchServers.size()) {
+            selectedServerName = g_guiState.patchServers[g_guiState.selectedPatchServer].c_str();
+        }
+
+        ImGui::BeginDisabled(g_guiState.patchServers.empty() || patchListLoading || g_guiState.patchDownloadInProgress);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo("##PatchServerCombo", selectedServerName)) {
+            for (int i = 0; i < (int)g_guiState.patchServers.size(); ++i) {
+                bool selected = g_guiState.selectedPatchServer == i;
+                if (ImGui::Selectable(g_guiState.patchServers[i].c_str(), selected)) {
+                    int previousSelection = g_guiState.selectedPatchServer;
+                    g_guiState.selectedPatchServer = i;
+                    g_guiState.patchEntries.clear();
+                    g_guiState.selectedPatchEntry = -1;
+                    patchSearchFilter[0] = '\0';
+                    if (patch_catalog_ui::ShouldLoadPatchesAfterSelection(previousSelection, i)) {
+                        startPatchListLoad(g_guiState.patchServers[i]);
+                    }
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+
+        ImGui::BeginDisabled(g_guiState.selectedPatchServer < 0 || patchListLoading || g_guiState.patchDownloadInProgress);
+        if (ImGui::Button("Refresh Patches", ImVec2(-1, compactButtonHeight))) {
+            std::string server = g_guiState.patchServers[g_guiState.selectedPatchServer];
+            startPatchListLoad(server);
+        }
+        ImGui::EndDisabled();
+
+        if (g_guiState.selectedPatchLanguage < 0 || g_guiState.selectedPatchLanguage >= patchLanguageCount) {
+            g_guiState.selectedPatchLanguage = 0;
+        }
+        ImGui::Text("Language:");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(g_guiState.patchDownloadInProgress);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo("##PatchLanguageCombo", patchLanguages[g_guiState.selectedPatchLanguage])) {
+            for (int i = 0; i < patchLanguageCount; ++i) {
+                bool selected = g_guiState.selectedPatchLanguage == i;
+                if (ImGui::Selectable(patchLanguages[i], selected)) {
+                    g_guiState.selectedPatchLanguage = i;
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+
+        ImGui::Text("Search patches:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##PatchSearch", patchSearchFilter, sizeof(patchSearchFilter));
+
+        float reservedForOutputAndConsole = 270.0f * scale;
+        if (g_guiState.patchDownloadInProgress) reservedForOutputAndConsole += compactButtonHeight + style.ItemSpacing.y;
+        float patchListHeight = ImGui::GetContentRegionAvail().y - reservedForOutputAndConsole;
+        if (patchListHeight < 58.0f * scale) patchListHeight = 58.0f * scale;
+        if (patchListHeight > 88.0f * scale) patchListHeight = 88.0f * scale;
+        ImGui::BeginChild("PatchList", ImVec2(-1, patchListHeight), true);
+        std::string patchFilter = patchSearchFilter;
+        for (int i = 0; i < (int)g_guiState.patchEntries.size(); ++i) {
+            const manifest_catalog::PatchEntry& patch = g_guiState.patchEntries[i];
+            if (!patchFilter.empty() && patch.version.find(patchFilter) == std::string::npos) {
+                continue;
+            }
+
+            bool selected = g_guiState.selectedPatchEntry == i;
+            const std::string& visibleVersion = patch.displayVersion.empty() ? patch.version : patch.displayVersion;
+            if (ImGui::Selectable(visibleVersion.c_str(), selected)) {
+                g_guiState.selectedPatchEntry = i;
+            }
+            if (ImGui::IsItemHovered() && visibleVersion != patch.version) {
+                ImGui::SetTooltip("Full version: %s", patch.version.c_str());
+            }
+        }
+        ImGui::EndChild();
+
+        std::string outputFolder = WideToUtf8(g_guiState.patchOutputFolder);
+        if (outputFolder.empty()) outputFolder = "No output folder selected";
+        std::string outputDisplay = CompactPathForDisplay(outputFolder, 44);
+        ImGui::Text("Output: %s", outputDisplay.c_str());
+        if (!g_guiState.patchOutputFolder.empty() && ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", outputFolder.c_str());
+        }
+
+        if (!patch_downloader::CoreAvailable()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "%s", patch_downloader::CoreUnavailableReason().c_str());
+        }
+
+        bool canDownloadPatch = g_guiState.selectedPatchEntry >= 0
+            && g_guiState.selectedPatchEntry < (int)g_guiState.patchEntries.size()
+            && !g_guiState.patchOutputFolder.empty()
+            && patch_downloader::CoreAvailable();
+
+        float patchActionWidth = (ImGui::GetContentRegionAvail().x - style.ItemSpacing.x) * 0.5f;
+        if (patchActionWidth < 120.0f * scale) patchActionWidth = ImGui::GetContentRegionAvail().x;
+
+        ImGui::BeginDisabled(g_guiState.patchDownloadInProgress);
+        if (ImGui::Button("Choose Output Folder...", ImVec2(patchActionWidth, compactButtonHeight))) {
+            std::wstring selectedFolder;
+            if (SelectFolder(L"Select patch download folder", selectedFolder)) {
+                g_guiState.patchOutputFolder = selectedFolder;
+            }
+        }
+        ImGui::EndDisabled();
+
+        bool drawPatchActionSameLine = patchActionWidth < ImGui::GetContentRegionAvail().x;
+        if (drawPatchActionSameLine) ImGui::SameLine();
+
+        if (g_guiState.patchDownloadInProgress) {
+            if (ImGui::Button("Cancel Download", ImVec2(drawPatchActionSameLine ? -1 : patchActionWidth, compactButtonHeight))) {
+                if (g_guiState.patchDownloadCancelFlag) {
+                    g_guiState.patchDownloadCancelFlag->store(true);
+                    std::lock_guard<std::mutex> lock(g_guiState.mtx);
+                    g_guiState.patchDownloaderStatus = "Cancelling download...";
+                }
+            }
+        } else {
+            ImGui::BeginDisabled(!canDownloadPatch);
+            if (ImGui::Button("Download Patch", ImVec2(drawPatchActionSameLine ? -1 : patchActionWidth, compactButtonHeight))) {
+                manifest_catalog::PatchEntry selectedPatch = g_guiState.patchEntries[g_guiState.selectedPatchEntry];
+                std::wstring outputDir = g_guiState.patchOutputFolder;
+                std::string selectedLanguage = patchLanguages[g_guiState.selectedPatchLanguage];
+                auto cancelFlag = std::make_shared<std::atomic_bool>(false);
+                g_guiState.patchDownloadCancelFlag = cancelFlag;
+                g_guiState.patchDownloadInProgress = true;
+                g_guiState.patchDownloaderStatus = "Resolving manifest link...";
+                g_guiState.patchDownloaderProgress.clear();
+
+                patchDownloadFuture = std::async(std::launch::async, [selectedPatch, outputDir, selectedLanguage, cancelFlag]() {
+                    PatchDownloadTaskResult taskResult;
+                    taskResult.patchVersion = selectedPatch.version;
+                    manifest_catalog::ManifestLinkResult linkResult = manifest_catalog::FetchManifestLink(selectedPatch);
+                    if (!linkResult.success) {
+                        taskResult.result.success = false;
+                        taskResult.result.message = linkResult.error;
+                        return taskResult;
+                    }
+
+                    patch_downloader::Options options;
+                    options.manifestUrl = linkResult.manifestUrl;
+                    options.outputDirectory = outputDir;
+                    options.language = selectedLanguage;
+                    options.threads = 4;
+                    options.cancelRequested = cancelFlag.get();
+                    options.onProgress = [](const patch_downloader::Progress& progress) {
+                        std::lock_guard<std::mutex> lock(g_guiState.mtx);
+                        g_guiState.patchDownloaderStatus = progress.message;
+                        if (progress.chunksTotal > 0) {
+                            g_guiState.patchDownloaderProgress =
+                                std::to_string(progress.filesDone) + "/" + std::to_string(progress.filesTotal)
+                                + " files, " + std::to_string(progress.chunksDone) + "/"
+                                + std::to_string(progress.chunksTotal) + " chunks";
+                        }
+                    };
+                    taskResult.result = patch_downloader::DownloadPatch(options);
+                    return taskResult;
+                });
+            }
+            ImGui::EndDisabled();
+        }
+
+        std::string patchStatus;
+        std::string patchProgress;
+        {
+            std::lock_guard<std::mutex> lock(g_guiState.mtx);
+            patchStatus = g_guiState.patchDownloaderStatus;
+            patchProgress = g_guiState.patchDownloaderProgress;
+        }
+        if (!patchStatus.empty()) {
+            ImGui::TextWrapped("Status: %s", patchStatus.c_str());
+            if (!patchProgress.empty()) {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 1.0f, 1.0f), "%s", patchProgress.c_str());
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
         ImGui::Text("Console:");
         
-        float consoleHeight = ImGui::GetContentRegionAvail().y - 10.0f * scale;
-        if (consoleHeight < 120.0f) consoleHeight = 120.0f;
+        float consoleHeight = ImGui::GetContentRegionAvail().y - 4.0f * scale;
+        if (consoleHeight < 90.0f * scale) consoleHeight = 90.0f * scale;
         ImGui::BeginChild("ConsoleLog", ImVec2(-1, consoleHeight), true, 
             ImGuiWindowFlags_HorizontalScrollbar);
         
@@ -952,6 +1267,7 @@ void RunGuiLoop() {
         }
         
         ImGui::EndChild();
+        ImGui::PopStyleVar();
         ImGui::EndChild();
         ImGui::End();
 

@@ -1,0 +1,362 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include <inttypes.h>
+#include <assert.h>
+#include "sha/sha256.h"
+#include "zstd/lib/zstd.h"
+#include "BLAKE3/c/blake3.h"
+
+#include "defs.h"
+#include "list.h"
+#include "rman.h"
+
+
+static uint64_t hash_sha256(BinaryData* data)
+{
+    uint8_t shaBuffer[32];
+    sha256(data->data, data->length, shaBuffer);
+    return to_(uint64_t, &shaBuffer);
+}
+
+static uint64_t hash_hkdf(BinaryData* data)
+{
+    // code taken straight from moonshadow, no idea what this shit is lol
+    sha256_context sha;
+    sha256_begin(&sha);
+    uint8_t key[64] = {0};
+    sha256_update(&sha, data->data, data->length);
+    sha256_end(&sha, key);
+    uint8_t ipad[64], opad[64];
+    memcpy(ipad, key, 64);
+    memcpy(opad, key, 64);
+    for (int i = 0; i < 64; i++) {
+        ipad[i] ^= 0x36;
+        opad[i] ^= 0x5C;
+    }
+    uint8_t buffer[32];
+    uint8_t index[4] = {0, 0, 0, 1};
+    sha256_begin(&sha);
+    sha256_update(&sha, ipad, 64);
+    sha256_update(&sha, index, 4);
+    sha256_end(&sha, buffer);
+    sha256_begin(&sha);
+    sha256_update(&sha, opad, 64);
+    sha256_update(&sha, buffer, 32);
+    sha256_end(&sha, buffer);
+    uint8_t result[8];
+    memcpy(result, buffer, 8);
+    for (int i = 0; i < 31; i++) {
+        sha256_begin(&sha);
+        sha256_update(&sha, ipad, 64);
+        sha256_update(&sha, buffer, 32);
+        sha256_end(&sha, buffer);
+        sha256_begin(&sha);
+        sha256_update(&sha, opad, 64);
+        sha256_update(&sha, buffer, 32);
+        sha256_end(&sha, buffer);
+        for (int i = 0; i < 8; i++) {
+            result[i] ^= buffer[i];
+        }
+    }
+
+    return to_(uint64_t, result);
+}
+
+static uint64_t hash_blake3(BinaryData* data)
+{
+    uint8_t blake3Buffer[8];
+    blake3_hasher hasher;
+    blake3_hasher_init(&hasher);
+    blake3_hasher_update(&hasher, data->data, data->length);
+    blake3_hasher_finalize(&hasher, blake3Buffer, sizeof(blake3Buffer));
+    return to_(uint64_t, blake3Buffer);
+
+}
+
+bool chunk_valid(BinaryData* chunk, uint64_t chunk_id, HashType hashType)
+{
+    switch (hashType) {
+        case HASHTYPE_SHA512:
+            // TODO
+            // is this ever used?
+            eprintf("Error: Unimplemented hashtype SHA512 encountered\n");
+            return false;
+        case HASHTYPE_SHA256:
+            return hash_sha256(chunk) == chunk_id;
+        case HASHTYPE_HKDF:
+            return hash_hkdf(chunk) == chunk_id;
+        case HASHTYPE_BLAKE3:
+            return hash_blake3(chunk) == chunk_id;
+        default:
+            eprintf("Error: Unknown hashtype %u\n", hashType);
+            return false;
+    }
+}
+
+BundleList* group_by_bundles(ChunkList* chunks)
+{
+    BundleList* unique_bundles = malloc(sizeof(BundleList));
+    initialize_list(unique_bundles);
+    for (uint32_t i = 0; i < chunks->length; i++) {
+        Bundle* to_find = NULL;
+        find_object_s(unique_bundles, to_find, bundle_id, chunks->objects[i].bundle_id);
+        if (!to_find) {
+            Bundle to_add = {.bundle_id = chunks->objects[i].bundle_id};
+            initialize_list(&to_add.chunks);
+            add_object_s(&to_add.chunks, &chunks->objects[i], bundle_offset);
+            add_object_s(unique_bundles, &to_add, bundle_id);
+        } else {
+            add_object_s(&to_find->chunks, &chunks->objects[i], bundle_offset);
+        }
+    }
+
+    return unique_bundles;
+}
+
+void free_manifest(Manifest* manifest)
+{
+    free(manifest->chunks.objects);
+
+    for (uint32_t i = 0; i < manifest->bundles.length; i++) {
+        free(manifest->bundles.objects[i].chunks.objects);
+    }
+    free(manifest->bundles.objects);
+
+    for (uint32_t i = 0; i < manifest->files.length; i++) {
+        free(manifest->files.objects[i].link);
+        free(manifest->files.objects[i].name);
+        free(manifest->files.objects[i].languages.objects);
+        free(manifest->files.objects[i].chunks.objects);
+    }
+    free(manifest->files.objects);
+
+    for (uint32_t i = 0; i < manifest->languages.length; i++) {
+        free(manifest->languages.objects[i].name);
+    }
+    free(manifest->languages.objects);
+
+    free(manifest->parameters.objects);
+
+    free(manifest);
+}
+
+char* duplicate_string(String* string)
+{
+    if (!string) return NULL;
+
+    char* new_string = malloc(string->length + 1);
+    memcpy(new_string, string->objects, string->length + 1);
+
+    return new_string;
+}
+
+int parse_body(Manifest* manifest, uint8_t* body)
+{
+    FlatBufferObject rootObject = FlatBufferObject_of(body);
+
+    // bundles (and their chunks)
+    OffsetVector* bundle_offsets = object_of(get_field(&rootObject, 0));
+    initialize_list_size(&manifest->bundles, bundle_offsets->length);
+    uint32_t total_chunks = 0;
+    for (uint32_t i = 0; i < bundle_offsets->length; i++) {
+        FlatBufferObject bundleObject = FlatBufferObject_of(&bundle_offsets->objects[i]);
+
+        Bundle new_bundle = {
+            .bundle_id = to_(uint64_t, get_field(&bundleObject, 0))
+        };
+
+        OffsetVector* chunk_offsets = object_of(get_field(&bundleObject, 1));
+        initialize_list_size(&new_bundle.chunks, chunk_offsets->length);
+        for (uint32_t i = 0; i < chunk_offsets->length; i++) {
+            FlatBufferObject chunkObject = FlatBufferObject_of(&chunk_offsets->objects[i]);
+
+            Chunk new_chunk = {
+                .compressed_size = to_(uint32_t, get_field(&chunkObject, 1)),
+                .uncompressed_size = to_(uint32_t, get_field(&chunkObject, 2)),
+                .chunk_id = to_(uint64_t, get_field(&chunkObject, 0)),
+                .bundle_offset = i == 0 ? 0 : new_bundle.chunks.objects[i - 1].bundle_offset + new_bundle.chunks.objects[i - 1].compressed_size,
+                .bundle_id = new_bundle.bundle_id
+            };
+            add_object(&new_bundle.chunks, &new_chunk);
+        }
+        add_object(&manifest->bundles, &new_bundle);
+        total_chunks += chunk_offsets->length;
+    }
+    initialize_list_size(&manifest->chunks, total_chunks);
+    for (uint32_t i = 0; i < manifest->bundles.length; i++) {
+        add_objects(&manifest->chunks, manifest->bundles.objects[i].chunks.objects, manifest->bundles.objects[i].chunks.length);
+    }
+    sort_list(&manifest->chunks, chunk_id);
+
+    // languages
+    OffsetVector* language_offsets = object_of(get_field(&rootObject, 1));
+    initialize_list_size(&manifest->languages, language_offsets->length);
+    for (uint32_t i = 0; i < language_offsets->length; i++) {
+        FlatBufferObject languageObject = FlatBufferObject_of(&language_offsets->objects[i]);
+
+        Language new_language = {
+            .language_id = to_(uint8_t, get_field(&languageObject, 0)),
+            .name = duplicate_string(object_of(get_field(&languageObject, 1)))
+        };
+        add_object_s(&manifest->languages, &new_language, language_id);
+    }
+
+    // file entries
+    FileEntryList file_entries;
+    OffsetVector* file_entry_offsets = object_of(get_field(&rootObject, 2));
+    initialize_list_size(&file_entries, file_entry_offsets->length);
+    for (uint32_t i = 0; i < file_entry_offsets->length; i++) {
+        FlatBufferObject fileEntryObject = FlatBufferObject_of(&file_entry_offsets->objects[i]);
+
+        FileEntry new_file_entry = {
+            .file_entry_id = to_(uint64_t, get_field(&fileEntryObject, 0)),
+            .directory_id = to_(uint64_t, get_field(&fileEntryObject, 1)), // optional
+            .file_size = to_(uint64_t, get_field(&fileEntryObject, 2)),
+            .name = object_of(get_field(&fileEntryObject, 3)),
+            .link = object_of(get_field(&fileEntryObject, 9)), // removed in 2.1
+            .chunk_ids = object_of(get_field(&fileEntryObject, 7)),
+            .param_index = to_(uint8_t, get_field(&fileEntryObject, 11)), // removed in 2.1
+        };
+        uint64_t language_mask = to_(uint64_t, get_field(&fileEntryObject, 4)); // optional
+        initialize_list(&new_file_entry.language_ids);
+        for (int i = 0; i < 64; i++) {
+            if (language_mask & (1ull << i)) {
+                add_object(&new_file_entry.language_ids, &(uint8_t) {i+1});
+            }
+        }
+        add_object(&file_entries, &new_file_entry);
+    }
+
+    // directories
+    DirectoryList directories;
+    OffsetVector* directory_offsets = object_of(get_field(&rootObject, 3));
+    initialize_list_size(&directories, directory_offsets->length);
+    for (uint32_t i = 0; i < directory_offsets->length; i++) {
+        FlatBufferObject directoryObject = FlatBufferObject_of(&directory_offsets->objects[i]);
+
+        Directory new_directory = {
+            .directory_id = to_(uint64_t, get_field(&directoryObject, 0)),
+            .parent_id = to_(uint64_t, get_field(&directoryObject, 1)), // optional
+            .name = object_of(get_field(&directoryObject, 2)),
+        };
+        add_object(&directories, &new_directory);
+    }
+
+    // chunk compression parameters, mainly need the hash type
+    OffsetVector* parameter_offsets = object_of(get_field(&rootObject, 5));
+    initialize_list_size(&manifest->parameters, parameter_offsets->length);
+    for (uint32_t i = 0; i < parameter_offsets->length; i++) {
+        FlatBufferObject parametersObject = FlatBufferObject_of(&parameter_offsets->objects[i]);
+        Parameters parameters = {
+            .hashType = to_(uint8_t, get_field(&parametersObject, 1)),
+            .min_chunk_size = to_(uint32_t, get_field(&parametersObject, 2)),
+            .max_chunk_size = to_(uint32_t, get_field(&parametersObject, 3)),
+            .max_uncompressed_size = to_(uint32_t, get_field(&parametersObject, 4)),
+        };
+        add_object(&manifest->parameters, &parameters);
+    }
+
+    // merge directories and file_entries together to a list of files
+    initialize_list_size(&manifest->files, file_entries.length);
+    for (uint32_t i = 0; i < file_entries.length; i++) {
+        File new_file = {
+            .file_size = file_entries.objects[i].file_size,
+            .link = duplicate_string(file_entries.objects[i].link)
+        };
+        initialize_list_size(&new_file.languages, file_entries.objects[i].language_ids.length);
+        for (uint32_t j = 0; j < file_entries.objects[i].language_ids.length; j++) {
+            Language* language = NULL;
+            find_object_s(&manifest->languages, language, language_id, file_entries.objects[i].language_ids.objects[j]);
+            add_object(&new_file.languages, language);
+        }
+        uint64_t directory_id = file_entries.objects[i].directory_id;
+        char temp_name[256];
+        strcpy(temp_name, file_entries.objects[i].name->objects);
+        while (directory_id) {
+            uint32_t j;
+            for (j = 0; j < directories.length; j++) {
+                if (directories.objects[j].directory_id == directory_id)
+                    break;
+            }
+            assert(j < directories.length);
+            directory_id = directories.objects[j].parent_id;
+            char backup_name[255];
+            strcpy(backup_name, temp_name);
+            assert(sprintf(temp_name, "%s/%s", directories.objects[j].name->objects, backup_name) < 256);
+        }
+        new_file.name = strdup(temp_name);
+        initialize_list_size(&new_file.chunks, file_entries.objects[i].chunk_ids->length);
+        uint64_t file_offset = 0;
+        for (uint32_t j = 0; j < file_entries.objects[i].chunk_ids->length; j++) {
+            Chunk* chunk = NULL;
+            find_object_s(&manifest->chunks, chunk, chunk_id, file_entries.objects[i].chunk_ids->objects[j]);
+            chunk->file_offset = file_offset;
+            chunk->hashType = manifest->parameters.objects[file_entries.objects[i].param_index].hashType;
+            add_object(&new_file.chunks, chunk);
+            file_offset += chunk->uncompressed_size;
+        }
+        add_object(&manifest->files, &new_file);
+    }
+
+    for (uint32_t i = 0; i < file_entries.length; i++) {
+        free(file_entries.objects[i].language_ids.objects);
+    }
+    free(file_entries.objects);
+    free(directories.objects);
+
+    dprintf("amount of chunks in this manifest: %u\n", total_chunks);
+
+    return 0;
+}
+
+Manifest* parse_manifest_data(uint8_t* data)
+{
+    if (strncmp((char*) data, "RMAN", 4)) {
+        eprintf("Not a valid RMAN file! Missing magic bytes.\n");
+        return NULL;
+    }
+
+    if (data[4] == 2 && data[5] != 0 && data[5] != 1) {
+        eprintf("Warning: Untested manifest version %d.%d detected. Everything should still work though.\n", data[4], data[5]);
+    } else if (data[4] != 2) {
+        eprintf("Error: Unsupported manifest version %d.%d detected.\n", data[4], data[5]);
+        return NULL;
+    }
+
+    Manifest* manifest = malloc(sizeof(Manifest));
+    uint32_t contentOffset = to_(uint32_t, data + 8);
+    uint32_t compressedSize = to_(uint32_t, data + 12);
+    manifest->manifest_id = to_(uint64_t, data + 16);
+    uint32_t uncompressedSize = to_(uint32_t, data + 24);
+
+    uint8_t* uncompressed_body = malloc(uncompressedSize);
+    assert(ZSTD_decompress(uncompressed_body, uncompressedSize, data + contentOffset, compressedSize) == uncompressedSize);
+
+    parse_body(manifest, uncompressed_body);
+    free(uncompressed_body);
+
+    return manifest;
+}
+
+Manifest* parse_manifest_f(char* filepath)
+{
+    FILE* manifest_file = fopen(filepath, "rb");
+    if (!manifest_file) {
+        eprintf("Error: Couldn't open manifest file (%s).\n", filepath);
+        return NULL;
+    }
+    // figure out the length of the file, to allocate the exact amount of needed memory
+    fseek(manifest_file, 0, SEEK_END);
+    int file_size = ftell(manifest_file);
+    rewind(manifest_file);
+    uint8_t* raw_manifest = malloc(file_size);
+    assert(fread(raw_manifest, 1, file_size, manifest_file) == (size_t) file_size);
+    fclose(manifest_file);
+
+    Manifest* parsed_manifest = parse_manifest_data(raw_manifest);
+    free(raw_manifest);
+    return parsed_manifest;
+}
